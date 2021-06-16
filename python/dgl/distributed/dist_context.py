@@ -85,6 +85,7 @@ def initialize(ip_config, num_servers=1, num_workers=0,
         from .dist_graph import DistGraphServer
         assert os.environ.get('DGL_SERVER_ID') is not None, \
                 'Please define DGL_SERVER_ID to run DistGraph server'
+        # why is there both DGL_IP_CONFIG and ip_config?
         assert os.environ.get('DGL_IP_CONFIG') is not None, \
                 'Please define DGL_IP_CONFIG to run DistGraph server'
         assert os.environ.get('DGL_NUM_SERVER') is not None, \

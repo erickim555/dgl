@@ -13,9 +13,18 @@ from threading import Thread
 
 DEFAULT_PORT = 30050
 
-def execute_remote(cmd, ip, port, thread_list):
+def execute_remote(cmd, ip, port, thread_list, username=""):
     """execute command line on remote machine via ssh"""
-    cmd = 'ssh -o StrictHostKeyChecking=no -p ' + str(port) + ' ' + ip + ' \'' + cmd + '\''
+    ip_prefix = ""
+    if username:
+        ip_prefix += "{username}@".format(username=username)
+    cmd = "ssh -o StrictHostKeyChecking=no -p {port} {ip_prefix}{ip} \'{cmd}\'".format(
+        port=str(port),
+        ip_prefix=ip_prefix,
+        ip=ip,
+        cmd=cmd,
+    )
+
     # thread func to run the job
     def run(cmd):
         subprocess.check_call(cmd, shell = True)
@@ -58,30 +67,38 @@ def submit_jobs(args, udf_command):
 
     tot_num_clients = args.num_trainers * (1 + args.num_samplers) * len(hosts)
     # launch server tasks
-    server_cmd = 'DGL_ROLE=server DGL_NUM_SAMPLER=' + str(args.num_samplers)
-    server_cmd = server_cmd + ' ' + 'OMP_NUM_THREADS=' + str(args.num_server_threads)
-    server_cmd = server_cmd + ' ' + 'DGL_NUM_CLIENT=' + str(tot_num_clients)
-    server_cmd = server_cmd + ' ' + 'DGL_CONF_PATH=' + str(args.part_config)
-    server_cmd = server_cmd + ' ' + 'DGL_IP_CONFIG=' + str(args.ip_config)
-    server_cmd = server_cmd + ' ' + 'DGL_NUM_SERVER=' + str(args.num_servers)
+    server_env_vars = 'DGL_ROLE=server DGL_NUM_SAMPLER=' + str(args.num_samplers)
+    server_env_vars = server_env_vars + ' ' + 'OMP_NUM_THREADS=' + str(args.num_server_threads)
+    server_env_vars = server_env_vars + ' ' + 'DGL_NUM_CLIENT=' + str(tot_num_clients)
+    server_env_vars = server_env_vars + ' ' + 'DGL_CONF_PATH=' + str(part_config)
+    server_env_vars = server_env_vars + ' ' + 'DGL_IP_CONFIG=' + str(ip_config)
+    server_env_vars = server_env_vars + ' ' + 'DGL_NUM_SERVER=' + str(args.num_servers)
     for i in range(len(hosts)*server_count_per_machine):
         ip, _ = hosts[int(i / server_count_per_machine)]
-        cmd = server_cmd + ' ' + 'DGL_SERVER_ID=' + str(i)
-        cmd = cmd + ' ' + udf_command
+        server_env_vars_cur = server_env_vars + ' ' + 'DGL_SERVER_ID=' + str(i)
+        # persist env vars for entire cmd block. required if udf_command is a chain of commands
+        # wrap in parens to not pollute env:
+        #     https://stackoverflow.com/a/45993803
+        cmd = "(export {server_env_vars}; {udf_command})".format(
+            server_env_vars=server_env_vars_cur,
+            udf_command=udf_command,
+        )
         cmd = 'cd ' + str(args.workspace) + '; ' + cmd
-        execute_remote(cmd, ip, args.ssh_port, thread_list)
+        print("\nserver{} cmd:\n{}\n\n".format(i, cmd))
+        execute_remote(cmd, ip, args.ssh_port, thread_list, username=args.ssh_username)
+
     # launch client tasks
-    client_cmd = 'DGL_DIST_MODE="distributed" DGL_ROLE=client DGL_NUM_SAMPLER=' + str(args.num_samplers)
-    client_cmd = client_cmd + ' ' + 'DGL_NUM_CLIENT=' + str(tot_num_clients)
-    client_cmd = client_cmd + ' ' + 'DGL_CONF_PATH=' + str(args.part_config)
-    client_cmd = client_cmd + ' ' + 'DGL_IP_CONFIG=' + str(args.ip_config)
-    client_cmd = client_cmd + ' ' + 'DGL_NUM_SERVER=' + str(args.num_servers)
+    client_env_vars = 'DGL_DIST_MODE="distributed" DGL_ROLE=client DGL_NUM_SAMPLER=' + str(args.num_samplers)
+    client_env_vars = client_env_vars + ' ' + 'DGL_NUM_CLIENT=' + str(tot_num_clients)
+    client_env_vars = client_env_vars + ' ' + 'DGL_CONF_PATH=' + str(part_config)
+    client_env_vars = client_env_vars + ' ' + 'DGL_IP_CONFIG=' + str(ip_config)
+    client_env_vars = client_env_vars + ' ' + 'DGL_NUM_SERVER=' + str(args.num_servers)
     if os.environ.get('OMP_NUM_THREADS') is not None:
-        client_cmd = client_cmd + ' ' + 'OMP_NUM_THREADS=' + os.environ.get('OMP_NUM_THREADS')
+        client_env_vars = client_env_vars + ' ' + 'OMP_NUM_THREADS=' + os.environ.get('OMP_NUM_THREADS')
     else:
-        client_cmd = client_cmd + ' ' + 'OMP_NUM_THREADS=' + str(args.num_omp_threads)
+        client_env_vars = client_env_vars + ' ' + 'OMP_NUM_THREADS=' + str(args.num_omp_threads)
     if os.environ.get('PYTHONPATH') is not None:
-        client_cmd = client_cmd + ' ' + 'PYTHONPATH=' + os.environ.get('PYTHONPATH')
+        client_env_vars = client_env_vars + ' ' + 'PYTHONPATH=' + os.environ.get('PYTHONPATH')
 
     torch_cmd = '-m torch.distributed.launch'
     torch_cmd = torch_cmd + ' ' + '--nproc_per_node=' + str(args.num_trainers)
@@ -92,22 +109,38 @@ def submit_jobs(args, udf_command):
     for node_id, host in enumerate(hosts):
         ip, _ = host
         new_torch_cmd = torch_cmd.replace('node_rank=0', 'node_rank='+str(node_id))
-        if 'python3' in udf_command:
+        if 'python3.7' in udf_command:
+            # we use python3.7 in image-retrieval, need this otherwise things break
+            new_udf_command = udf_command.replace('python3.7', 'python3.7 ' + new_torch_cmd)
+        elif 'python3' in udf_command:
             new_udf_command = udf_command.replace('python3', 'python3 ' + new_torch_cmd)
         elif 'python2' in udf_command:
             new_udf_command = udf_command.replace('python2', 'python2 ' + new_torch_cmd)
         else:
             new_udf_command = udf_command.replace('python', 'python ' + new_torch_cmd)
-        cmd = client_cmd + ' ' + new_udf_command
+        # persist env vars for entire cmd block. required if udf_command is a chain of commands
+        # wrap in parens to not pollute env:
+        #     https://stackoverflow.com/a/45993803
+        cmd = "(export {client_env_vars}; {new_udf_command})".format(
+            client_env_vars=client_env_vars,
+            new_udf_command=new_udf_command,
+        )
         cmd = 'cd ' + str(args.workspace) + '; ' + cmd
-        execute_remote(cmd, ip, args.ssh_port, thread_list)
-
+        print("\n\n cmd (node_id={}):\n{}\n\n".format(node_id, cmd))
+        execute_remote(cmd, ip, args.ssh_port, thread_list, username=args.ssh_username)
+    print("\n\nlen(thread_list): {}\n\n".format(len(thread_list)))
     for thread in thread_list:
         thread.join()
 
 def main():
     parser = argparse.ArgumentParser(description='Launch a distributed job')
     parser.add_argument('--ssh_port', type=int, default=22, help='SSH Port.')
+    parser.add_argument(
+        "--ssh_username", default="",
+        help="Optional. When issuing commands (via ssh) to cluster, use the provided username in the ssh cmd. "
+             "Example: If you provide --ssh_username=bob, then the ssh command will be like: 'ssh bob@1.2.3.4 CMD' "
+             "instead of 'ssh 1.2.3.4 CMD'"
+    )
     parser.add_argument('--workspace', type=str,
                         help='Path of user directory of distributed tasks. \
                         This is used to specify a destination location where \
