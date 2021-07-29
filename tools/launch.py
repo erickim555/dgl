@@ -263,6 +263,77 @@ def wrap_udf_in_torch_dist_launcher(
     return new_udf_command
 
 
+def construct_server_env_vars(
+        num_samplers: int,
+        num_server_threads: int,
+        tot_num_clients: int,
+        part_config: str,
+        ip_config: str,
+        num_servers: int,
+        graph_format: str,
+) -> str:
+    server_env_vars_template = (
+        "DGL_ROLE={DGL_ROLE} "
+        "DGL_NUM_SAMPLER={DGL_NUM_SAMPLER} "
+        "OMP_NUM_THREADS={OMP_NUM_THREADS} "
+        "DGL_NUM_CLIENT={DGL_NUM_CLIENT} "
+        "DGL_CONF_PATH={DGL_CONF_PATH} "
+        "DGL_IP_CONFIG={DGL_IP_CONFIG} "
+        "DGL_NUM_SERVER={DGL_NUM_SERVER} "
+        "DGL_GRAPH_FORMAT={DGL_GRAPH_FORMAT} "
+    )
+    return server_env_vars_template.format(
+        DGL_ROLE="server",
+        DGL_NUM_SAMPLER=num_samplers,
+        OMP_NUM_THREADS=num_server_threads,
+        DGL_NUM_CLIENT=tot_num_clients,
+        DGL_CONF_PATH=part_config,
+        DGL_IP_CONFIG=ip_config,
+        DGL_NUM_SERVER=num_servers,
+        DGL_GRAPH_FORMAT=graph_format,
+    )
+
+
+def construct_client_env_vars(
+        num_samplers: int,
+        tot_num_clients: int,
+        part_config: str,
+        ip_config: str,
+        num_servers: int,
+        graph_format: str,
+        num_omp_threads: int,
+        pythonpath: Optional[str] = "",
+) -> str:
+    client_env_vars_template = (
+        "DGL_DIST_MODE={DGL_DIST_MODE} "
+        "DGL_ROLE={DGL_ROLE} "
+        "DGL_NUM_SAMPLER={DGL_NUM_SAMPLER} "
+        "DGL_NUM_CLIENT={DGL_NUM_CLIENT} "
+        "DGL_CONF_PATH={DGL_CONF_PATH} "
+        "DGL_IP_CONFIG={DGL_IP_CONFIG} "
+        "DGL_NUM_SERVER={DGL_NUM_SERVER} "
+        "DGL_GRAPH_FORMAT={DGL_GRAPH_FORMAT} "
+        "OMP_NUM_THREADS={OMP_NUM_THREADS} "
+        "{suffix_optional_envvars}"
+    )
+    # append optional additional env-vars
+    suffix_optional_envvars = ""
+    if pythonpath:
+        suffix_optional_envvars += f"PYTHONPATH={pythonpath} "
+    return client_env_vars_template.format(
+        DGL_DIST_MODE="distributed",
+        DGL_ROLE="client",
+        DGL_NUM_SAMPLER=num_samplers,
+        DGL_NUM_CLIENT=tot_num_clients,
+        DGL_CONF_PATH=part_config,
+        DGL_IP_CONFIG=ip_config,
+        DGL_NUM_SERVER=num_servers,
+        DGL_GRAPH_FORMAT=graph_format,
+        OMP_NUM_THREADS=num_omp_threads,
+        suffix_optional_envvars=suffix_optional_envvars,
+    )
+
+
 def submit_jobs(args, udf_command):
     """Submit distributed jobs (server and client processes) via ssh"""
     hosts = []
@@ -296,33 +367,39 @@ def submit_jobs(args, udf_command):
 
     tot_num_clients = args.num_trainers * (1 + args.num_samplers) * len(hosts)
     # launch server tasks
-    server_cmd = 'DGL_ROLE=server DGL_NUM_SAMPLER=' + str(args.num_samplers)
-    server_cmd = server_cmd + ' ' + 'OMP_NUM_THREADS=' + str(args.num_server_threads)
-    server_cmd = server_cmd + ' ' + 'DGL_NUM_CLIENT=' + str(tot_num_clients)
-    server_cmd = server_cmd + ' ' + 'DGL_CONF_PATH=' + str(args.part_config)
-    server_cmd = server_cmd + ' ' + 'DGL_IP_CONFIG=' + str(args.ip_config)
-    server_cmd = server_cmd + ' ' + 'DGL_NUM_SERVER=' + str(args.num_servers)
-    server_cmd = server_cmd + ' ' + 'DGL_GRAPH_FORMAT=' + str(args.graph_format)
-    for i in range(len(hosts)*server_count_per_machine):
+    server_env_vars = construct_server_env_vars(
+        num_samplers=args.num_samplers,
+        num_server_threads=args.num_server_threads,
+        tot_num_clients=tot_num_clients,
+        part_config=args.part_config,
+        ip_config=args.ip_config,
+        num_servers=args.num_servers,
+        graph_format=args.graph_format,
+    )
+    for i in range(len(hosts) * server_count_per_machine):
         ip, _ = hosts[int(i / server_count_per_machine)]
-        cmd = server_cmd + ' ' + 'DGL_SERVER_ID=' + str(i)
-        cmd = cmd + ' ' + udf_command
+        server_env_vars_cur = f"{server_env_vars} DGL_SERVER_ID={i}"
+        # use `export` to persist env vars for entire cmd block. required if udf_command is a chain of commands
+        # also: wrap in parens to not pollute env:
+        #     https://stackoverflow.com/a/45993803
+        cmd = "(export {server_env_vars}; {udf_command})".format(
+            server_env_vars=server_env_vars_cur,
+            udf_command=udf_command,
+        )
         cmd = 'cd ' + str(args.workspace) + '; ' + cmd
         thread_list.append(execute_remote(cmd, ip, args.ssh_port, username=args.ssh_username))
 
     # launch client tasks
-    client_cmd = 'DGL_DIST_MODE="distributed" DGL_ROLE=client DGL_NUM_SAMPLER=' + str(args.num_samplers)
-    client_cmd = client_cmd + ' ' + 'DGL_NUM_CLIENT=' + str(tot_num_clients)
-    client_cmd = client_cmd + ' ' + 'DGL_CONF_PATH=' + str(args.part_config)
-    client_cmd = client_cmd + ' ' + 'DGL_IP_CONFIG=' + str(args.ip_config)
-    client_cmd = client_cmd + ' ' + 'DGL_NUM_SERVER=' + str(args.num_servers)
-    if os.environ.get('OMP_NUM_THREADS') is not None:
-        client_cmd = client_cmd + ' ' + 'OMP_NUM_THREADS=' + os.environ.get('OMP_NUM_THREADS')
-    else:
-        client_cmd = client_cmd + ' ' + 'OMP_NUM_THREADS=' + str(args.num_omp_threads)
-    if os.environ.get('PYTHONPATH') is not None:
-        client_cmd = client_cmd + ' ' + 'PYTHONPATH=' + os.environ.get('PYTHONPATH')
-    client_cmd = client_cmd + ' ' + 'DGL_GRAPH_FORMAT=' + str(args.graph_format)
+    client_env_vars = construct_client_env_vars(
+        num_samplers=args.num_samplers,
+        tot_num_clients=tot_num_clients,
+        part_config=args.part_config,
+        ip_config=args.ip_config,
+        num_servers=args.num_servers,
+        graph_format=args.graph_format,
+        num_omp_threads=os.environ.get("OMP_NUM_THREADS", str(args.num_omp_threads)),
+        pythonpath=os.environ.get("PYTHONPATH", ""),
+    )
 
     for node_id, host in enumerate(hosts):
         ip, _ = host
@@ -335,7 +412,13 @@ def submit_jobs(args, udf_command):
             master_addr=hosts[0][0],
             master_port=1234,
         )
-        cmd = client_cmd + ' ' + torch_dist_udf_command
+        # use `export` to persist env vars for entire cmd block. required if udf_command is a chain of commands
+        # also: wrap in parens to not pollute env:
+        #     https://stackoverflow.com/a/45993803
+        cmd = "(export {client_env_vars}; {new_udf_command})".format(
+            client_env_vars=client_env_vars,
+            new_udf_command=torch_dist_udf_command,
+        )
         cmd = 'cd ' + str(args.workspace) + '; ' + cmd
         thread_list.append(execute_remote(cmd, ip, args.ssh_port, username=args.ssh_username))
 
